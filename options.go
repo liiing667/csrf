@@ -120,14 +120,37 @@ func CookieName(name string) Option {
 	}
 }
 
-// TrustedOrigins configures a set of origins (Referers) that are considered as trusted.
-// This will allow cross-domain CSRF use-cases - e.g. where the front-end is served
-// from a different domain than the API server - to correctly pass a CSRF check.
+// TrustedOrigins configures a set of origins that are considered trusted.
+// This allows cross-domain CSRF use-cases - e.g. where the front-end is
+// served from a different origin than the API server - to correctly pass a
+// CSRF check.
+//
+// Every entry must be an absolute origin of the form
+// "scheme://host[:port]" (e.g. "https://ui.example.com" or
+// "http://localhost:3000"). Entries are matched exactly against the
+// scheme, host and port of the request Origin/Referer header. Entries
+// containing userinfo, a path, a query, a fragment, a wildcard, or an
+// invalid port are ignored, as are entries with any scheme other than
+// http or https. Malformed or ignored entries never match a request, so
+// misconfiguration fails closed.
+//
+// Migrating from csrf v1.7.x configuration: bare hosts such as
+// "ui.example.com" are no longer accepted because they could not express a
+// scheme and implicitly trusted both http://ui.example.com and
+// https://ui.example.com (see CVE-2025-47909). Replace each bare host with
+// the explicit origin served by that host, e.g. "https://ui.example.com".
+// List both "http://ui.example.com" and "https://ui.example.com" only if
+// cleartext traffic from that host must remain trusted.
 //
 // You should only provide origins you own or have full control over.
 func TrustedOrigins(origins []string) Option {
 	return func(cs *csrf) {
-		cs.opts.TrustedOrigins = origins
+		cs.opts.trustedOrigins = make(map[string]struct{}, len(origins))
+		for _, origin := range origins {
+			if key, ok := parseTrustedOrigin(origin); ok {
+				cs.opts.trustedOrigins[key] = struct{}{}
+			}
+		}
 	}
 }
 

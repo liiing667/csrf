@@ -153,9 +153,12 @@ func generateRandomBytes(n int) ([]byte, error) {
 }
 
 // sameOrigin returns true if URLs a and b share the same origin. The same
-// origin is defined as host (which includes the port) and scheme.
+// origin is defined by the tuple of scheme, host and port, with scheme and
+// host compared case-insensitively and scheme-default ports normalized away.
 func sameOrigin(a, b *url.URL) bool {
-	return (a.Scheme == b.Scheme && a.Host == b.Host)
+	keyA, okA := originKey(a)
+	keyB, okB := originKey(b)
+	return okA && okB && keyA == keyB
 }
 
 // compare securely (constant-time) compares the unmasked token from the request

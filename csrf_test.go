@@ -246,12 +246,19 @@ func TestTrustedReferer(t *testing.T) {
 		trustedOrigin []string
 		shouldPass    bool
 	}{
-		{[]string{"golang.org"}, true},
-		{[]string{"api.example.com", "golang.org"}, true},
+		{[]string{"https://golang.org"}, true},
+		{[]string{"https://api.example.com", "https://golang.org"}, true},
+		{[]string{"https://golang.org:443"}, true},
+		{[]string{"HTTPS://GOLANG.ORG"}, true},
 		{[]string{"http://golang.org"}, false},
-		{[]string{"https://golang.org"}, false},
 		{[]string{"http://example.com"}, false},
+		{[]string{"https://example.com"}, false},
 		{[]string{"example.com"}, false},
+		{[]string{"https://golang.org/path"}, false},
+		{[]string{"https://user:pass@golang.org"}, false},
+		{[]string{"https://*.golang.org"}, false},
+		{[]string{"https://golang.org:9999"}, false},
+		{[]string{"ftp://golang.org"}, false},
 	}
 
 	for _, item := range testTable {
@@ -494,7 +501,7 @@ func TestProtectScenarios(t *testing.T) {
 			// Set the Referer header
 			switch {
 			case tt.refererTrusted:
-				p = Protect(testKey, TrustedOrigins([]string{"external-trusted-origin.test"}))(mux)
+				p = Protect(testKey, TrustedOrigins([]string{"https://external-trusted-origin.test"}))(mux)
 				r.Header.Set("Referer", "https://external-trusted-origin.test/foobar")
 			case tt.refererUntrusted:
 				r.Header.Set("Referer", "http://www.invalid-referer.org")

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 
 	"github.com/gorilla/securecookie"
 )
@@ -98,14 +97,17 @@ type options struct {
 	Path   string
 	// Note that the function and field names match the case of the associated
 	// http.Cookie field instead of the "correct" HTTPOnly name that golint suggests.
-	HttpOnly       bool
-	Secure         bool
-	SameSite       SameSiteMode
-	RequestHeader  string
-	FieldName      string
-	ErrorHandler   http.Handler
-	CookieName     string
-	TrustedOrigins []string
+	HttpOnly      bool
+	Secure        bool
+	SameSite      SameSiteMode
+	RequestHeader string
+	FieldName     string
+	ErrorHandler  http.Handler
+	CookieName    string
+	// trustedOrigins holds the canonicalized "scheme://host[:port]" keys
+	// produced by the TrustedOrigins option. Invalid entries are not added,
+	// so misconfiguration fails closed.
+	trustedOrigins map[string]struct{}
 }
 
 // Protect is HTTP middleware that provides Cross-Site Request Forgery
@@ -280,12 +282,12 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin != "" {
 			parsedOrigin, err := url.Parse(origin)
-			if err != nil {
+			if err != nil || parsedOrigin.Host == "" {
 				r = envError(r, ErrBadOrigin)
 				cs.opts.ErrorHandler.ServeHTTP(w, r)
 				return
 			}
-			if !sameOrigin(&requestURL, parsedOrigin) && !slices.Contains(cs.opts.TrustedOrigins, parsedOrigin.Host) {
+			if !sameOrigin(&requestURL, parsedOrigin) && !isTrustedOrigin(cs.opts.trustedOrigins, parsedOrigin) {
 				r = envError(r, ErrBadOrigin)
 				cs.opts.ErrorHandler.ServeHTTP(w, r)
 				return
@@ -316,9 +318,11 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// If the request is being served via TLS and the Referer is not the
-			// same origin, check the domain against our allowlist. We only
-			// check when we have host information from the referer.
-			if referer.Host != "" && referer.Host != r.Host && !slices.Contains(cs.opts.TrustedOrigins, referer.Host) {
+			// same origin, check it against our allowlist. Path-only Referers
+			// (no host) are same-origin navigations and are allowed above. The
+			// same canonical scheme+host+port comparison is used here as for
+			// the Origin header so the two code paths cannot diverge.
+			if referer.Host != "" && !sameOrigin(&requestURL, referer) && !isTrustedOrigin(cs.opts.trustedOrigins, referer) {
 				r = envError(r, ErrBadReferer)
 				cs.opts.ErrorHandler.ServeHTTP(w, r)
 				return
