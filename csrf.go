@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"time"
 
 	"github.com/gorilla/securecookie"
 )
@@ -88,6 +89,7 @@ type csrf struct {
 	h    http.Handler
 	sc   *securecookie.SecureCookie
 	st   store
+	rg   *replayGuard
 	opts options
 }
 
@@ -116,6 +118,11 @@ type options struct {
 // The original (unmasked) token is stored in the session, which is inaccessible
 // by an attacker (provided you are using HTTPS). Subsequent requests are
 // expected to include this token, which is compared against the session token.
+// On a successful unsafe request the presented real token is consumed and
+// rotated: a new real token is persisted through the store and the response
+// exposes a freshly masked token, so a leaked or replayed token cannot be
+// reused. Concurrent requests presenting the same in-flight token are
+// coalesced onto the single rotation instead of being rejected as replays.
 // Requests that do not provide a matching token are served with a HTTP 403
 // 'Forbidden' error response.
 //
@@ -204,6 +211,10 @@ func Protect(authKey []byte, opts ...Option) func(http.Handler) http.Handler {
 				domain:   cs.opts.Domain,
 				sc:       cs.sc,
 			}
+		}
+
+		if cs.rg == nil {
+			cs.rg = newReplayGuard(time.Duration(cs.opts.MaxAge) * time.Second)
 		}
 
 		return cs
@@ -349,6 +360,59 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Enforce one-time use of the real token while letting concurrent
+		// duplicates (double clicks, parallel submissions) ride the same
+		// consumption instead of being rejected as replays.
+		leader, call, isReplay := cs.rg.begin(realToken)
+		if isReplay {
+			r = envError(r, ErrBadToken)
+			cs.opts.ErrorHandler.ServeHTTP(w, r)
+			return
+		}
+
+		if !leader {
+			// A concurrent request is already consuming this token. Wait for
+			// the leader to finish rotation and fail with the same reason if
+			// rotation could not be completed.
+			rotatedToken, err := cs.rg.wait(call)
+			if err != nil {
+				r = envError(r, err)
+				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				return
+			}
+
+			realToken = rotatedToken
+			r = contextSave(r, tokenKey, mask(realToken, r))
+		} else {
+			var rotateErr error
+			previousToken := realToken
+			defer func() {
+				cs.rg.finish(previousToken, realToken, call, rotateErr)
+			}()
+
+			// Rotate the real token: the presented token is consumed and a new
+			// one is persisted through the same store API, keeping the
+			// stateless mask design and existing stores compatible.
+			newToken, err := generateRandomBytes(tokenLength)
+			if err != nil {
+				rotateErr = err
+				r = envError(r, err)
+				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				return
+			}
+
+			if err := cs.st.Save(newToken, w); err != nil {
+				rotateErr = err
+				r = envError(r, err)
+				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				return
+			}
+
+			realToken = newToken
+			// Refresh the masked token in the request context so the response
+			// (form fields, headers, JSON bodies) carries the rotated token.
+			r = contextSave(r, tokenKey, mask(realToken, r))
+		}
 	}
 
 	// Set the Vary: Cookie header to protect clients from caching the response.

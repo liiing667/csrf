@@ -170,6 +170,20 @@ important.
 * Go's `crypto/rand` library is used to generate the 32 byte (256 bit) tokens
 and the one-time-pad used for masking them.
 
+* A successful unsafe (POST/PUT/PATCH/DELETE/etc.) request consumes the
+presented real token: a fresh real token is generated, persisted through the
+configured store, and a freshly masked token is exposed for the response.
+Replaying a consumed token is therefore rejected with ErrBadToken. Concurrent
+duplicates of the same in-flight token (double clicks, parallel retries) are
+coalesced onto the same rotation instead of being mistaken for replays, so at
+least one of them succeeds. The anti-replay bookkeeping is kept in an
+in-process, best-effort cache keyed by the real token; the session cookie
+remains the source of truth, which keeps the stateless per-request masking,
+the cookie payload format and existing custom store implementations
+compatible. In a multi-instance deployment without sticky sessions the cache
+is per process, so replay protection degrades gracefully to the underlying
+session semantics rather than breaking legitimate requests.
+
 This library does not seek to be adventurous.
 
 */

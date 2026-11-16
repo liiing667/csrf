@@ -377,6 +377,19 @@ Getting CSRF protection right is important, so here's some background:
   for legacy systems. The SameSite attribute can be set with the SameSite option.
 - Go's `crypto/rand` library is used to generate the 32 byte (256 bit) tokens
   and the one-time-pad used for masking them.
+- A successful unsafe request (POST/PUT/PATCH/DELETE/etc.) **rotates** the
+  real token: the presented token is consumed, a new real token is saved via
+  the configured store and a freshly masked token is returned for the next
+  request. Replaying a consumed token fails with the same `ErrBadToken`
+  rejection as any other invalid token. Concurrent duplicates of one in-flight
+  token (double clicks, parallel submissions) are coalesced onto the same
+  rotation so they are not mistaken for replays — at least one succeeds and the
+  others receive the rotated token. The anti-replay state is an in-process,
+  best-effort cache; the session cookie stays the source of truth, so the
+  stateless masking design, cookie format and existing custom `store`
+  implementations remain compatible. In a multi-instance deployment the cache
+  is per process (use sticky sessions, or a shared store, for global replay
+  enforcement).
 
 This library does not seek to be adventurous.
 
