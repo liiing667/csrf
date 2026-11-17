@@ -20,6 +20,7 @@ const (
 	formKey      string = "gorilla.csrf.Form"  // #nosec G101
 	errorKey     string = "gorilla.csrf.Error"
 	skipCheckKey string = "gorilla.csrf.Skip"
+	policyKey    string = "gorilla.csrf.Policy"
 	cookieName   string = "_gorilla_csrf"
 	errorPrefix  string = "gorilla/csrf: "
 )
@@ -85,10 +86,11 @@ const (
 )
 
 type csrf struct {
-	h    http.Handler
-	sc   *securecookie.SecureCookie
-	st   store
-	opts options
+	h      http.Handler
+	sc     *securecookie.SecureCookie
+	st     store
+	opts   options
+	policy CookiePolicy
 }
 
 // options contains the optional settings for the CSRF middleware.
@@ -183,6 +185,37 @@ func Protect(authKey []byte, opts ...Option) func(http.Handler) http.Handler {
 			cs.opts.RequestHeader = headerName
 		}
 
+		// Resolve one immutable policy snapshot from the options. This same
+		// snapshot drives both cookie issuance (the store) and cookie
+		// validation (the middleware), and is exposed via Policy(r) for
+		// auditing.
+		cs.policy = CookiePolicy{
+			Name:     cs.opts.CookieName,
+			MaxAge:   cs.opts.MaxAge,
+			Domain:   cs.opts.Domain,
+			Path:     cs.opts.Path,
+			HttpOnly: cs.opts.HttpOnly,
+			Secure:   cs.opts.Secure,
+			SameSite: cs.opts.SameSite,
+		}
+
+		// Fail at startup on policy combinations that browsers would reject
+		// or that would scope the cookie incorrectly.
+		if err := cs.policy.validate(); err != nil {
+			panic(err)
+		}
+
+		// A custom store may carry its own policy. Its routing attributes must
+		// match the resolved snapshot so that a cookie issued by the store can
+		// always be read back by the middleware.
+		if cs.st != nil {
+			if carrier, ok := cs.st.(PolicyCarrier); ok {
+				if field, conflict := cs.policy.conflictsWith(carrier.CookiePolicy()); conflict {
+					panic(&PolicyError{Field: field, Err: ErrPolicyConflict})
+				}
+			}
+		}
+
 		// Create an authenticated securecookie instance.
 		if cs.sc == nil {
 			cs.sc = securecookie.New(authKey, nil)
@@ -194,16 +227,7 @@ func Protect(authKey []byte, opts ...Option) func(http.Handler) http.Handler {
 
 		if cs.st == nil {
 			// Default to the cookieStore
-			cs.st = &cookieStore{
-				name:     cs.opts.CookieName,
-				maxAge:   cs.opts.MaxAge,
-				secure:   cs.opts.Secure,
-				httpOnly: cs.opts.HttpOnly,
-				sameSite: cs.opts.SameSite,
-				path:     cs.opts.Path,
-				domain:   cs.opts.Domain,
-				sc:       cs.sc,
-			}
+			cs.st = newCookieStore(cs.policy, cs.sc)
 		}
 
 		return cs
@@ -212,6 +236,10 @@ func Protect(authKey []byte, opts ...Option) func(http.Handler) http.Handler {
 
 // Implements http.Handler for the csrf type.
 func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Publish the resolved policy snapshot so custom error handlers and the
+	// wrapped application can audit the exact cookie/token policy in effect.
+	r = contextSave(r, policyKey, cs.policy)
+
 	// Skip the check if directed to. This should always be a bool.
 	if val, err := contextGet(r, skipCheckKey); err == nil {
 		if skip, ok := val.(bool); ok {

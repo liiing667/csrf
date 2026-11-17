@@ -24,28 +24,35 @@ type store interface {
 
 // cookieStore is a signed cookie session store for CSRF tokens.
 type cookieStore struct {
-	name     string
-	maxAge   int
-	secure   bool
-	httpOnly bool
-	path     string
-	domain   string
-	sc       *securecookie.SecureCookie
-	sameSite SameSiteMode
+	policy CookiePolicy
+	sc     *securecookie.SecureCookie
+}
+
+// newCookieStore builds a cookieStore bound to the single CookiePolicy
+// snapshot resolved by the middleware. Issuance and validation therefore
+// always observe the same SameSite, Secure, Path and Domain attributes.
+func newCookieStore(policy CookiePolicy, sc *securecookie.SecureCookie) *cookieStore {
+	return &cookieStore{policy: policy, sc: sc}
+}
+
+// CookiePolicy implements PolicyCarrier so that the store's policy can be
+// audited and cross-checked against the middleware's resolved snapshot.
+func (cs *cookieStore) CookiePolicy() CookiePolicy {
+	return cs.policy
 }
 
 // Get retrieves a CSRF token from the session cookie. It returns an empty token
 // if decoding fails (e.g. HMAC validation fails or the named cookie doesn't exist).
 func (cs *cookieStore) Get(r *http.Request) ([]byte, error) {
 	// Retrieve the cookie from the request
-	cookie, err := r.Cookie(cs.name)
+	cookie, err := r.Cookie(cs.policy.Name)
 	if err != nil {
 		return nil, err
 	}
 
 	token := make([]byte, tokenLength)
 	// Decode the HMAC authenticated cookie.
-	err = cs.sc.Decode(cs.name, cookie.Value, &token)
+	err = cs.sc.Decode(cs.policy.Name, cookie.Value, &token)
 	if err != nil {
 		return nil, err
 	}
@@ -56,28 +63,28 @@ func (cs *cookieStore) Get(r *http.Request) ([]byte, error) {
 // Save stores the CSRF token in the session cookie.
 func (cs *cookieStore) Save(token []byte, w http.ResponseWriter) error {
 	// Generate an encoded cookie value with the CSRF token.
-	encoded, err := cs.sc.Encode(cs.name, token)
+	encoded, err := cs.sc.Encode(cs.policy.Name, token)
 	if err != nil {
 		return err
 	}
 
 	cookie := &http.Cookie{
-		Name:     cs.name,
+		Name:     cs.policy.Name,
 		Value:    encoded,
-		MaxAge:   cs.maxAge,
-		HttpOnly: cs.httpOnly,
-		Secure:   cs.secure,
-		SameSite: http.SameSite(cs.sameSite),
-		Path:     cs.path,
-		Domain:   cs.domain,
+		MaxAge:   cs.policy.MaxAge,
+		HttpOnly: cs.policy.HttpOnly,
+		Secure:   cs.policy.Secure,
+		SameSite: http.SameSite(cs.policy.SameSite),
+		Path:     cs.policy.Path,
+		Domain:   cs.policy.Domain,
 	}
 
 	// Set the Expires field on the cookie based on the MaxAge
 	// If MaxAge <= 0, we don't set the Expires attribute, making the cookie
 	// session-only.
-	if cs.maxAge > 0 {
+	if cs.policy.MaxAge > 0 {
 		cookie.Expires = time.Now().Add(
-			time.Duration(cs.maxAge) * time.Second)
+			time.Duration(cs.policy.MaxAge) * time.Second)
 	}
 
 	// Write the authenticated cookie to the response.

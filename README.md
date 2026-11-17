@@ -40,7 +40,9 @@ gorilla/csrf is also compatible with middleware 'helper' libraries like
     + [JavaScript Applications](#javascript-applications)
     + [Google App Engine](#google-app-engine)
     + [Setting SameSite](#setting-samesite)
+    + [Cookie path](#cookie-path)
     + [Setting Options](#setting-options)
+    + [Auditing the cookie policy](#auditing-the-cookie-policy)
   * [Design Notes](#design-notes)
   * [License](#license)
 
@@ -352,6 +354,36 @@ Not too bad, right?
 
 If there's something you're confused about or a feature you would like to see
 added, open an issue.
+
+### Auditing the cookie policy
+
+The SameSite, Secure, Path, Domain, MaxAge and HttpOnly attributes are resolved
+once from the functional options into a single immutable `CookiePolicy`
+snapshot. That same snapshot is handed to the token store when a cookie is
+issued and to the middleware when the cookie is read back, so the cookie the
+browser returns is always the cookie that was issued.
+
+Audit the snapshot in effect for any request (including inside a custom error
+handler) with `csrf.Policy`:
+
+```go
+http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    policy := csrf.Policy(r)
+    fmt.Printf("cookie %s: SameSite=%d Secure=%t Path=%q Domain=%q\n",
+        policy.Name, policy.SameSite, policy.Secure, policy.Path, policy.Domain)
+})
+```
+
+Conflicting configuration fails at startup (a `panic` wrapping a
+`*csrf.PolicyError`) instead of silently issuing a cookie the browser will not
+return:
+
+- `SameSite(SameSiteNoneMode)` requires `Secure(true)` — browsers reject
+  `SameSite=None` cookies without the Secure attribute.
+- Unknown `SameSiteMode` values, non-hostname `Domain` values and relative
+  `Path` values are rejected.
+- A custom store implementing `CookiePolicy() CookiePolicy` must match the
+  options-derived snapshot on SameSite, Secure, Path and Domain.
 
 ## Design Notes
 
