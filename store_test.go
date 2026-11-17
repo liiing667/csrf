@@ -23,8 +23,9 @@ type brokenSaveStore struct {
 }
 
 func (bs *brokenSaveStore) Get(*http.Request) ([]byte, error) {
-	// Generate an invalid token so we can progress to our Save method
-	return generateRandomBytes(24)
+	// Report a missing token so the middleware mints a fresh one and
+	// progresses to our Save method.
+	return nil, &StoreError{Op: "get", Err: ErrStoreNotFound}
 }
 
 func (bs *brokenSaveStore) Save(realToken []byte, w http.ResponseWriter) error {
@@ -79,6 +80,66 @@ func TestCookieDecode(t *testing.T) {
 	if err == nil {
 		t.Fatal("cookiestore did not report an invalid hashkey on decode")
 	}
+}
+
+// TestCookieGetErrorClassifications verifies the cookieStore distinguishes the
+// three store failure classes required for fail-closed handling.
+func TestCookieGetErrorClassifications(t *testing.T) {
+	var age = 3600
+	sc := securecookie.New(testKey, nil)
+	sc.MaxAge(age)
+	st := &cookieStore{cookieName, age, true, true, "", "", sc, SameSiteDefaultMode}
+
+	t.Run("missing cookie is not found", func(t *testing.T) {
+		r, err := http.NewRequest("GET", "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = st.GetError(r)
+		if !errors.Is(err, ErrStoreNotFound) {
+			t.Fatalf("missing cookie should map to ErrStoreNotFound: got %v", err)
+		}
+	})
+
+	t.Run("tampered cookie is decode failure", func(t *testing.T) {
+		r, err := http.NewRequest("GET", "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Cookie", fmt.Sprintf("%s=%s", cookieName, "not-a-valid-cookie"))
+
+		_, err = st.GetError(r)
+		if !errors.Is(err, ErrStoreDecode) {
+			t.Fatalf("tampered cookie should map to ErrStoreDecode: got %v", err)
+		}
+	})
+
+	t.Run("valid cookie returns the token", func(t *testing.T) {
+		realToken, err := generateRandomBytes(tokenLength)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		rr := httptest.NewRecorder()
+		if err := st.Save(realToken, rr); err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := http.NewRequest("GET", "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Cookie", rr.Header().Get("Set-Cookie"))
+
+		got, err := st.GetError(r)
+		if err != nil {
+			t.Fatalf("valid cookie should decode without error: got %v", err)
+		}
+		if string(got) != string(realToken) {
+			t.Fatalf("decoded token mismatch: got %v want %v", got, realToken)
+		}
+	})
 }
 
 // TestCookieEncode tests that an invalid cookie store returns an encoding error.

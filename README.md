@@ -41,6 +41,7 @@ gorilla/csrf is also compatible with middleware 'helper' libraries like
     + [Google App Engine](#google-app-engine)
     + [Setting SameSite](#setting-samesite)
     + [Setting Options](#setting-options)
+  * [Store Failure Handling](#store-failure-handling)
   * [Design Notes](#design-notes)
   * [License](#license)
 
@@ -352,6 +353,32 @@ Not too bad, right?
 
 If there's something you're confused about or a feature you would like to see
 added, open an issue.
+
+## Store Failure Handling
+
+The middleware distinguishes three outcomes when loading the session token and
+applies a different strategy to each, failing closed by default so that a
+storage outage or a tampered cookie can never be turned into a CSRF bypass:
+
+- **Missing token (`csrf.ErrStoreNotFound`)** — no token has been issued yet
+  (for example the named cookie is absent). This is the normal first-visit
+  case: the middleware mints a new token and saves it to the store.
+- **Invalid token (`csrf.ErrStoreDecode`)** — a token is present but failed
+  HMAC validation or decoding, or decoded to the wrong length. The request is
+  rejected with a 403 and **no replacement token is issued**, preventing an
+  attacker from rotating a victim's session token.
+- **Store unavailable (`csrf.ErrStoreUnavailable`)** — the backing storage
+  returned an error. The request is rejected with a 403 rather than degrading
+  into a freshly minted, unvalidated token. The same rule applies to a failure
+  while saving a newly minted token.
+
+Custom stores can participate by implementing the optional `csrf.ErrorStore`
+interface and returning a `*csrf.StoreError` (or any error wrapping one of the
+sentinels above) from `GetError`. Stores that only implement the legacy `Get`
+method keep working unchanged; any error they return is conservatively
+classified as `csrf.ErrStoreUnavailable`, i.e. fail closed. The failure reason
+remains available to a custom [ErrorHandler](#setting-options) via
+`csrf.FailureReason(r)`.
 
 ## Design Notes
 

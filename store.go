@@ -4,6 +4,7 @@
 package csrf
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
@@ -35,19 +36,33 @@ type cookieStore struct {
 }
 
 // Get retrieves a CSRF token from the session cookie. It returns an empty token
-// if decoding fails (e.g. HMAC validation fails or the named cookie doesn't exist).
+// if decoding fails (e.g. HMAC validation fails or the named cookie doesn't
+// exist). A missing cookie is classified as ErrStoreNotFound, while an
+// authentication or decoding failure is classified as ErrStoreDecode so the
+// middleware can fail closed instead of silently minting a replacement token.
 func (cs *cookieStore) Get(r *http.Request) ([]byte, error) {
+	return cs.GetError(r)
+}
+
+// GetError retrieves a CSRF token from the session cookie and classifies any
+// failure. A missing cookie returns ErrStoreNotFound (first visit); a cookie
+// that is present but fails HMAC validation or decoding returns
+// ErrStoreDecode (tampered or corrupt token).
+func (cs *cookieStore) GetError(r *http.Request) ([]byte, error) {
 	// Retrieve the cookie from the request
 	cookie, err := r.Cookie(cs.name)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, http.ErrNoCookie) {
+			return nil, &StoreError{Op: "get", Err: ErrStoreNotFound, Cause: err}
+		}
+		return nil, &StoreError{Op: "get", Err: ErrStoreUnavailable, Cause: err}
 	}
 
 	token := make([]byte, tokenLength)
 	// Decode the HMAC authenticated cookie.
 	err = cs.sc.Decode(cs.name, cookie.Value, &token)
 	if err != nil {
-		return nil, err
+		return nil, &StoreError{Op: "get", Err: ErrStoreDecode, Cause: err}
 	}
 
 	return token, nil

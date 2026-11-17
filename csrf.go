@@ -222,15 +222,23 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Retrieve the token from the session.
-	// An error represents either a cookie that failed HMAC validation
-	// or that doesn't exist.
-	realToken, err := cs.st.Get(r)
-	if err != nil || len(realToken) != tokenLength {
-		// If there was an error retrieving the token, the token doesn't exist
-		// yet, or it's the wrong length, generate a new token.
-		// Note that the new token will (correctly) fail validation downstream
-		// as it will no longer match the request token.
+	// Retrieve the token from the session. The three failure classes are
+	// handled with distinct strategies so that a backend failure or a
+	// tampered cookie can never be turned into a token refresh (and thus a
+	// downgrade) by an attacker:
+	//   - ErrStoreNotFound: no token has been issued yet (first visit). Mint
+	//     a new token and save it to the store.
+	//   - ErrStoreDecode: a token is present but failed HMAC validation or
+	//     decoding. Fail closed without issuing a replacement token.
+	//   - ErrStoreUnavailable: the backing store errored. Fail closed rather
+	//     than continuing with a freshly minted token.
+	realToken, err := cs.getRealToken(r)
+	if err != nil {
+		r = envError(r, err)
+		cs.opts.ErrorHandler.ServeHTTP(w, r)
+		return
+	}
+	if realToken == nil {
 		realToken, err = generateRandomBytes(tokenLength)
 		if err != nil {
 			r = envError(r, err)
@@ -238,10 +246,11 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Save the new (real) token in the session store.
+		// Save the new (real) token in the session store. A save failure is a
+		// backend outage: fail closed instead of issuing an unsaved token.
 		err = cs.st.Save(realToken, w)
 		if err != nil {
-			r = envError(r, err)
+			r = envError(r, &StoreError{Op: "save", Err: ErrStoreUnavailable, Cause: err})
 			cs.opts.ErrorHandler.ServeHTTP(w, r)
 			return
 		}
@@ -367,6 +376,57 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func PlaintextHTTPRequest(r *http.Request) *http.Request {
 	ctx := context.WithValue(r.Context(), PlaintextHTTPContextKey, true)
 	return r.WithContext(ctx)
+}
+
+// getRealToken loads the session token and applies the store failure policy.
+// It returns:
+//   - (token, nil) when a well-formed token was retrieved;
+//   - (nil, nil) when no token exists yet and the caller must mint one
+//     (ErrStoreNotFound);
+//   - (nil, err) when the store is unavailable or the stored token failed
+//     validation, in which case the caller must fail closed.
+//
+// Stores implementing ErrorStore classify their own errors. Legacy stores
+// implementing only the store interface remain supported, but any error they
+// return is treated as ErrStoreUnavailable (fail closed).
+func (cs *csrf) getRealToken(r *http.Request) ([]byte, error) {
+	var (
+		realToken []byte
+		err       error
+	)
+
+	if es, ok := cs.st.(ErrorStore); ok {
+		realToken, err = es.GetError(r)
+	} else {
+		realToken, err = cs.st.Get(r)
+	}
+
+	if err != nil {
+		switch classifyStoreError(err) {
+		case ErrStoreNotFound:
+			// First visit: the caller generates and saves a fresh token.
+			return nil, nil
+		case ErrStoreDecode:
+			// The store already classified this failure; surface it as-is so
+			// its underlying cause is not wrapped twice.
+			return nil, err
+		default:
+			// Classified unavailable, or an unclassified error from a legacy
+			// store, which fails closed as unavailable.
+			if errors.Is(err, ErrStoreUnavailable) {
+				return nil, err
+			}
+			return nil, &StoreError{Op: "get", Err: ErrStoreUnavailable, Cause: err}
+		}
+	}
+
+	// A token that decodes but has the wrong length is malformed. Treat it as
+	// a validation failure rather than silently replacing it.
+	if len(realToken) != tokenLength {
+		return nil, &StoreError{Op: "get", Err: ErrStoreDecode}
+	}
+
+	return realToken, nil
 }
 
 // unauthorizedhandler sets a HTTP 403 Forbidden status and writes the
