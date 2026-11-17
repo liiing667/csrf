@@ -102,9 +102,45 @@ func unmask(issued []byte) []byte {
 	return xorToken(otp, masked)
 }
 
-// requestToken returns the issued token (pad + masked token) from the HTTP POST
-// body or HTTP header. It will return nil if the token fails to decode.
-func (cs *csrf) requestToken(r *http.Request) ([]byte, error) {
+// maskedTokenLength is the length of a base64-encoded masked token (the
+// one-time-pad plus the masked session token). It is used to reject oversized
+// inputs before they force any allocation.
+var maskedTokenLength = base64.StdEncoding.EncodedLen(tokenLength * 2)
+
+// validToken is the single shared boundary for CSRF token verification. It
+// takes the raw base64-encoded token supplied in the request and the real
+// (unmasked) session token, then performs the length check, mask parsing and
+// constant-time comparison in one place. Because the mask is generated per
+// request, every distinct mask of the same session token validates here, which
+// keeps repeated submissions and concurrent requests (e.g. multiple browser
+// tabs) working against one comparison boundary.
+//
+// Inputs longer than a valid encoded token are rejected before base64
+// decoding, so a forged oversized value never triggers a decoding allocation.
+func validToken(issued string, realToken []byte) bool {
+	// Reject empty and oversized inputs up front without allocating.
+	if len(issued) != maskedTokenLength {
+		return false
+	}
+
+	// Decode the "issued" (pad + masked) token sent in the request.
+	decoded, err := base64.StdEncoding.DecodeString(issued)
+	if err != nil {
+		return false
+	}
+
+	// Split the one-time-pad from the masked token and unmask it.
+	requestToken := unmask(decoded)
+
+	// Compare the request token against the real session token in constant
+	// time.
+	return compareTokens(requestToken, realToken)
+}
+
+// requestToken returns the raw issued (pad + masked) token from the HTTP
+// header, POST form or multipart form. It returns an empty string when no
+// token is present; decoding and verification are handled by validToken.
+func (cs *csrf) requestToken(r *http.Request) string {
 	// 1. Check the HTTP header first.
 	issued := r.Header.Get(cs.opts.RequestHeader)
 
@@ -122,19 +158,7 @@ func (cs *csrf) requestToken(r *http.Request) ([]byte, error) {
 		}
 	}
 
-	// Return nil (equivalent to empty byte slice) if no token was found
-	if issued == "" {
-		return nil, nil
-	}
-
-	// Decode the "issued" (pad + masked) token sent in the request. Return a
-	// nil byte slice on a decoding error (this will fail upstream).
-	decoded, err := base64.StdEncoding.DecodeString(issued)
-	if err != nil {
-		return nil, err
-	}
-
-	return decoded, nil
+	return issued
 }
 
 // generateRandomBytes returns securely generated random bytes.

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -541,4 +542,78 @@ func createRequest(method, path string, useTLS bool) *http.Request {
 		return PlaintextHTTPRequest(r)
 	}
 	return r
+}
+
+// TestRepeatedAndConcurrentMaskedTokens verifies that every per-request mask
+// issued for one session token remains a valid submission, both sequentially
+// and under concurrent requests.
+func TestRepeatedAndConcurrentMaskedTokens(t *testing.T) {
+	var tokens []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, Token(r))
+	})
+	mux.HandleFunc("/submit", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	p := Protect(testKey)(mux)
+
+	// Establish the session cookie and collect several distinct masked tokens.
+	// Every request presents the same session cookie: the middleware only
+	// writes a new cookie when no valid one exists, and all per-request masks
+	// are derived from the single real token in that session.
+	recorders := make([]*httptest.ResponseRecorder, 16)
+	for i := 0; i < 16; i++ {
+		r := createRequest("GET", "/", false)
+		if i > 0 {
+			setCookie(recorders[0], r)
+		}
+		recorders[i] = httptest.NewRecorder()
+		p.ServeHTTP(recorders[i], r)
+	}
+
+	if len(tokens) != 16 {
+		t.Fatalf("collected %d tokens want 16", len(tokens))
+	}
+
+	unique := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		unique[token] = struct{}{}
+	}
+	if len(unique) != len(tokens) {
+		t.Fatalf("expected unique per-request masks, got %d unique of %d",
+			len(unique), len(tokens))
+	}
+
+	// Submit every mask concurrently against the single session boundary.
+	var wg sync.WaitGroup
+	statuses := make(chan int, len(tokens))
+
+	for _, token := range tokens {
+		wg.Add(1)
+		go func(token string) {
+			defer wg.Done()
+
+			rec := httptest.NewRecorder()
+			req := createRequest("POST", "/submit", false)
+			// The session cookie is only written when no valid cookie exists,
+			// so the first response carries the stable session cookie.
+			setCookie(recorders[0], req)
+			req.Header.Set("X-CSRF-Token", token)
+			p.ServeHTTP(rec, req)
+			statuses <- rec.Code
+		}(token)
+	}
+
+	wg.Wait()
+	close(statuses)
+
+	for status := range statuses {
+		if status != http.StatusOK {
+			t.Fatalf("masked token submission failed: got %v want %v",
+				status, http.StatusOK)
+		}
+	}
 }

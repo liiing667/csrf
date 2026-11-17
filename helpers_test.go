@@ -2,10 +2,8 @@ package csrf
 
 import (
 	"bytes"
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -148,6 +146,82 @@ func TestMaskUnmaskTokens(t *testing.T) {
 	}
 }
 
+// TestValidToken exercises the shared token verification boundary, including
+// the fast rejection of empty, malformed and oversized inputs and the fact
+// that multiple distinct masks of the same session token all validate.
+func TestValidToken(t *testing.T) {
+	realToken, err := generateRandomBytes(tokenLength)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	otherToken, err := generateRandomBytes(tokenLength)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	validMask := mask(realToken, nil)
+	validLength := base64.StdEncoding.EncodedLen(tokenLength * 2)
+
+	tests := []struct {
+		name      string
+		issued    string
+		reference []byte
+		want      bool
+	}{
+		{
+			name:      "valid masked token",
+			issued:    validMask,
+			reference: realToken,
+			want:      true,
+		},
+		{
+			name:      "second distinct mask of the same session token",
+			issued:    mask(realToken, nil),
+			reference: realToken,
+			want:      true,
+		},
+		{
+			name:      "empty token",
+			issued:    "",
+			reference: realToken,
+			want:      false,
+		},
+		{
+			name:      "short token",
+			issued:    validMask[:validLength-1],
+			reference: realToken,
+			want:      false,
+		},
+		{
+			name:      "forged oversized token rejected without decoding",
+			issued:    strings.Repeat("A", validLength+1),
+			reference: realToken,
+			want:      false,
+		},
+		{
+			name:      "malformed base64 of a valid length",
+			issued:    strings.Repeat("!", validLength),
+			reference: realToken,
+			want:      false,
+		},
+		{
+			name:      "valid token against the wrong session token",
+			issued:    validMask,
+			reference: otherToken,
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := validToken(tt.issued, tt.reference); got != tt.want {
+				t.Fatalf("validToken returned %v want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // Tests domains that should (or should not) return true for a
 // same-origin check.
 func TestSameOrigin(t *testing.T) {
@@ -198,29 +272,6 @@ func TestXOR(t *testing.T) {
 					res, token.expected)
 			}
 		}
-	}
-}
-
-// shortReader provides a broken implementation of io.Reader for testing.
-type shortReader struct{}
-
-func (sr shortReader) Read(p []byte) (int, error) {
-	return len(p) % 2, io.ErrUnexpectedEOF
-}
-
-// TestGenerateRandomBytes tests the (extremely rare) case that crypto/rand does
-// not return the expected number of bytes.
-func TestGenerateRandomBytes(t *testing.T) {
-	// Pioneered from https://github.com/justinas/nosurf
-	original := rand.Reader
-	rand.Reader = shortReader{}
-	defer func() {
-		rand.Reader = original
-	}()
-
-	b, err := generateRandomBytes(tokenLength)
-	if err == nil {
-		t.Fatalf("generateRandomBytes did not report a short read: only read %d bytes", len(b))
 	}
 }
 

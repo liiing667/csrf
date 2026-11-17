@@ -326,24 +326,16 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Retrieve the combined token (pad + masked) token...
-		maskedToken, err := cs.requestToken(r)
-		if err != nil {
-			r = envError(r, ErrBadToken)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
-		}
-
-		if maskedToken == nil {
+		issuedToken := cs.requestToken(r)
+		if issuedToken == "" {
 			r = envError(r, ErrNoToken)
 			cs.opts.ErrorHandler.ServeHTTP(w, r)
 			return
 		}
 
-		// ... and unmask it.
-		requestToken := unmask(maskedToken)
-
-		// Compare the request token against the real token
-		if !compareTokens(requestToken, realToken) {
+		// ... and validate it through the shared length check, mask parsing
+		// and constant-time comparison against the real session token.
+		if !validToken(issuedToken, realToken) {
 			r = envError(r, ErrBadToken)
 			cs.opts.ErrorHandler.ServeHTTP(w, r)
 			return
