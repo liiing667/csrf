@@ -1,6 +1,7 @@
 package csrf
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +165,79 @@ func TestBadCookie(t *testing.T) {
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("middleware failed to reject a bad cookie: got %v want %v",
 			rr.Code, http.StatusForbidden)
+	}
+}
+
+// TestDuplicateCookies tests that a request carrying more than one cookie
+// with the CSRF cookie name fails closed: a single cookie passes, duplicates
+// are rejected with a 403, no fresh cookie is issued, and the failure reason
+// is ErrMultipleCookies.
+func TestDuplicateCookies(t *testing.T) {
+	var failureReason error
+	s := http.NewServeMux()
+	p := Protect(testKey, ErrorHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failureReason = FailureReason(r)
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+	})))(s)
+
+	var token string
+	s.Handle("/", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		token = Token(r)
+	}))
+
+	// Obtain a valid CSRF cookie & token via a GET request.
+	r := createRequest("GET", "/", false)
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, r)
+
+	setCookie := rr.Header().Get("Set-Cookie")
+	if setCookie == "" {
+		t.Fatal("cookie not set")
+	}
+	// Fixed Cookie header fixtures: strip the attributes, keeping only the
+	// name=value pair the browser would send back.
+	single := strings.SplitN(setCookie, ";", 2)[0]
+	duplicate := single + "; " + single
+
+	// A single cookie value passes, including on non-idempotent methods.
+	r = createRequest("POST", "/", false)
+	r.Header.Set("Cookie", single)
+	r.Header.Set("X-CSRF-Token", token)
+
+	rr = httptest.NewRecorder()
+	p.ServeHTTP(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("middleware rejected a single cookie: got %v want %v",
+			rr.Code, http.StatusOK)
+	}
+
+	// Duplicate cookies with the CSRF name are rejected, even on safe
+	// methods, and must not trigger issuance of a fresh cookie.
+	for _, method := range []string{"GET", "POST"} {
+		failureReason = nil
+
+		r = createRequest(method, "/", false)
+		r.Header.Set("Cookie", duplicate)
+		r.Header.Set("X-CSRF-Token", token)
+
+		rr = httptest.NewRecorder()
+		p.ServeHTTP(rr, r)
+
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("%s: middleware did not fail closed on duplicate cookies: got %v want %v",
+				method, rr.Code, http.StatusForbidden)
+		}
+
+		if !errors.Is(failureReason, ErrMultipleCookies) {
+			t.Fatalf("%s: incorrect failure reason: got %v want %v",
+				method, failureReason, ErrMultipleCookies)
+		}
+
+		if c := rr.Header().Get("Set-Cookie"); c != "" {
+			t.Fatalf("%s: middleware issued a fresh cookie on duplicate cookies: got %q",
+				method, c)
+		}
 	}
 }
 

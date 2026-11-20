@@ -62,6 +62,12 @@ var (
 	// ErrBadToken is returned if the CSRF token in the request does not match
 	// the token in the session, or is otherwise malformed.
 	ErrBadToken = errors.New("CSRF token invalid")
+	// ErrMultipleCookies is returned if the request contains more than one
+	// cookie with the CSRF cookie name. Browsers scope cookies by path and
+	// domain, so a duplicate name means the "first" cookie read by the server
+	// may not be the one the browser (or a reverse proxy) treats as
+	// authoritative. The middleware fails closed rather than guessing.
+	ErrMultipleCookies = errors.New("multiple CSRF cookies in request")
 )
 
 // SameSiteMode allows a server to define a cookie attribute making it impossible for
@@ -226,6 +232,14 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// An error represents either a cookie that failed HMAC validation
 	// or that doesn't exist.
 	realToken, err := cs.st.Get(r)
+	if errors.Is(err, ErrMultipleCookies) {
+		// Fail closed: an ambiguous (duplicate) CSRF cookie must not be
+		// resolved by silently issuing a fresh token, which would mislead
+		// the client about its session state.
+		r = envError(r, err)
+		cs.opts.ErrorHandler.ServeHTTP(w, r)
+		return
+	}
 	if err != nil || len(realToken) != tokenLength {
 		// If there was an error retrieving the token, the token doesn't exist
 		// yet, or it's the wrong length, generate a new token.

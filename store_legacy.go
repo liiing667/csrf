@@ -39,15 +39,27 @@ type cookieStore struct {
 // Get retrieves a CSRF token from the session cookie. It returns an empty token
 // if decoding fails (e.g. HMAC validation fails or the named cookie doesn't exist).
 func (cs *cookieStore) Get(r *http.Request) ([]byte, error) {
-	// Retrieve the cookie from the request
-	cookie, err := r.Cookie(cs.name)
-	if err != nil {
-		return nil, err
+	// Retrieve the cookie from the request. Fail closed if more than one
+	// cookie carries the CSRF cookie name: cookies are scoped by path and
+	// domain, so duplicates can shadow one another and net/http would only
+	// surface the first, which may not match the browser's identity.
+	var cookie *http.Cookie
+	for _, c := range r.Cookies() {
+		if c.Name != cs.name {
+			continue
+		}
+		if cookie != nil {
+			return nil, ErrMultipleCookies
+		}
+		cookie = c
+	}
+	if cookie == nil {
+		return nil, http.ErrNoCookie
 	}
 
 	token := make([]byte, tokenLength)
 	// Decode the HMAC authenticated cookie.
-	err = cs.sc.Decode(cs.name, cookie.Value, &token)
+	err := cs.sc.Decode(cs.name, cookie.Value, &token)
 	if err != nil {
 		return nil, err
 	}
