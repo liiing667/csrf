@@ -57,6 +57,10 @@ var (
 	// ErrBadReferer is returned when the scheme & host in the URL do not match
 	// the supplied Referer header.
 	ErrBadReferer = errors.New("referer invalid")
+	// ErrOriginRefererMismatch is returned when both the Origin and Referer
+	// headers are supplied but identify different sources, so the two pieces
+	// of evidence cannot be reconciled into a single trusted origin.
+	ErrOriginRefererMismatch = errors.New("origin and referer identify different sources")
 	// ErrNoToken is returned if no CSRF token is supplied in the request.
 	ErrNoToken = errors.New("CSRF token not found in request")
 	// ErrBadToken is returned if the CSRF token in the request does not match
@@ -278,8 +282,10 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// if we have an Origin header, check it against our allowlist
 		origin := r.Header.Get("Origin")
+		var parsedOrigin *url.URL
 		if origin != "" {
-			parsedOrigin, err := url.Parse(origin)
+			var err error
+			parsedOrigin, err = url.Parse(origin)
 			if err != nil {
 				r = envError(r, ErrBadOrigin)
 				cs.opts.ErrorHandler.ServeHTTP(w, r)
@@ -322,6 +328,45 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				r = envError(r, ErrBadReferer)
 				cs.opts.ErrorHandler.ServeHTTP(w, r)
 				return
+			}
+		}
+
+		// If both the Origin and Referer headers are supplied over TLS, the
+		// two pieces of source evidence must agree: the Referer is held to
+		// the same standard as a standalone Referer, and it must identify
+		// the same source as the Origin header. A missing Referer is
+		// tolerated here (the Origin evidence stands alone), but a
+		// contradictory one is rejected.
+		if origin != "" && !isPlaintext {
+			if refererHeader := r.Referer(); refererHeader != "" {
+				referer, err := url.Parse(refererHeader)
+				if err != nil {
+					r = envError(r, ErrBadReferer)
+					cs.opts.ErrorHandler.ServeHTTP(w, r)
+					return
+				}
+
+				// disallow cleartext HTTP referers when serving via TLS
+				if referer.Scheme == "http" {
+					r = envError(r, ErrBadReferer)
+					cs.opts.ErrorHandler.ServeHTTP(w, r)
+					return
+				}
+
+				// the Referer must be same-origin or on the allowlist,
+				// exactly as if no Origin header had been supplied.
+				if referer.Host != "" && referer.Host != r.Host && !slices.Contains(cs.opts.TrustedOrigins, referer.Host) {
+					r = envError(r, ErrBadReferer)
+					cs.opts.ErrorHandler.ServeHTTP(w, r)
+					return
+				}
+
+				// both headers name an absolute source: they must agree.
+				if referer.Host != "" && parsedOrigin.Host != "" && referer.Host != parsedOrigin.Host {
+					r = envError(r, ErrOriginRefererMismatch)
+					cs.opts.ErrorHandler.ServeHTTP(w, r)
+					return
+				}
 			}
 		}
 

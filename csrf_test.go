@@ -381,6 +381,9 @@ func TestProtectScenarios(t *testing.T) {
 		refererUntrusted     bool
 		refererHTTPDowngrade bool
 		refererRelative      bool
+		originRefererSame    bool
+		originRefererTrusted bool
+		originRefererClash   bool
 		tokenValid           bool
 		tokenInvalid         bool
 		want                 bool
@@ -456,6 +459,26 @@ func TestProtectScenarios(t *testing.T) {
 			refererRelative: true,
 			tokenInvalid:    true,
 		},
+		{
+			name:              "TLS POST with same-origin origin & referer & valid token pass",
+			secureRequest:     true,
+			originRefererSame: true,
+			tokenValid:        true,
+			want:              true,
+		},
+		{
+			name:                 "TLS POST with trusted cross-origin origin & referer & valid token pass",
+			secureRequest:        true,
+			originRefererTrusted: true,
+			tokenValid:           true,
+			want:                 true,
+		},
+		{
+			name:               "TLS POST with trusted origin & conflicting trusted referer reject",
+			secureRequest:      true,
+			originRefererClash: true,
+			tokenValid:         true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -502,6 +525,23 @@ func TestProtectScenarios(t *testing.T) {
 				r.Header.Set("Referer", "http://www.gorillatoolkit.org/foobar")
 			case tt.refererRelative:
 				r.Header.Set("Referer", "/foobar")
+			}
+
+			// Set both the Origin & Referer headers together
+			switch {
+			case tt.originRefererSame:
+				r.Header.Set("Origin", "https://www.gorillatoolkit.org")
+				r.Header.Set("Referer", "https://www.gorillatoolkit.org/foobar")
+			case tt.originRefererTrusted:
+				p = Protect(testKey, TrustedOrigins([]string{"external-trusted-origin.test"}))(mux)
+				r.Header.Set("Origin", "https://external-trusted-origin.test")
+				r.Header.Set("Referer", "https://external-trusted-origin.test/foobar")
+			case tt.originRefererClash:
+				// Both headers are individually acceptable, but name
+				// different sources and so cannot be reconciled.
+				p = Protect(testKey, TrustedOrigins([]string{"external-trusted-origin.test"}))(mux)
+				r.Header.Set("Origin", "https://external-trusted-origin.test")
+				r.Header.Set("Referer", "https://www.gorillatoolkit.org/foobar")
 			}
 
 			// Set the CSRF token & associated cookie
