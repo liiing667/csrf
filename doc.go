@@ -167,6 +167,12 @@ approaches.
 over HTTPS only) and are HttpOnly by default, because sane defaults are
 important.
 
+* Rejected requests are answered with HTTP 403, share the same
+"Vary: Cookie" identity boundary as a successful response, and additionally
+carry "Cache-Control: no-store" and "Pragma: no-cache" so that a shared cache
+cannot replay one identity's rejection for another. A rejection never issues
+or rotates a CSRF cookie, so an error response cannot carry a reusable token.
+
 * Go's `crypto/rand` library is used to generate the 32 byte (256 bit) tokens
 and the one-time-pad used for masking them.
 

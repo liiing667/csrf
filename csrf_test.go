@@ -109,8 +109,22 @@ func TestMethods(t *testing.T) {
 				rr.Code, http.StatusOK)
 		}
 
-		if rr.Header().Get("Set-Cookie") == "" {
-			t.Fatalf("cookie not set: got %q", rr.Header().Get("Set-Cookie"))
+		// A rejected request must not be issued a fresh, reusable token.
+		if rr.Header().Get("Set-Cookie") != "" {
+			t.Fatalf("rejected response must not set a cookie: got %q",
+				rr.Header().Get("Set-Cookie"))
+		}
+
+		// Rejections share the identity cache boundary of successful
+		// responses and must never be stored by a cache.
+		if rr.Header().Get("Vary") != "Cookie" {
+			t.Fatalf("vary header not set on rejection: got %q want %q",
+				rr.Header().Get("Vary"), "Cookie")
+		}
+
+		if rr.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("rejected response must not be cacheable: got Cache-Control %q want %q",
+				rr.Header().Get("Cache-Control"), "no-store")
 		}
 	}
 }
@@ -541,4 +555,188 @@ func createRequest(method, path string, useTLS bool) *http.Request {
 		return PlaintextHTTPRequest(r)
 	}
 	return r
+}
+
+// TestFailureResponseCacheHeaders is the fixed matrix of status codes and
+// cache headers that every CSRF rejection must satisfy:
+//   - HTTP 403 Forbidden
+//   - Vary: Cookie (the same identity cache boundary as a success response)
+//   - Cache-Control: no-store and Pragma: no-cache (never cached)
+//   - no Set-Cookie (a rejection never carries a reusable token)
+func TestFailureResponseCacheHeaders(t *testing.T) {
+	s := http.NewServeMux()
+
+	var token string
+	s.Handle("/", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		token = Token(r)
+	}))
+
+	p := Protect(testKey)(s)
+
+	// Obtain a valid CSRF cookie + masked token via a GET request.
+	getRR := httptest.NewRecorder()
+	p.ServeHTTP(getRR, createRequest("GET", "/", true))
+	validCookie := getRR.Header().Get("Set-Cookie")
+
+	tests := []struct {
+		name    string
+		useTLS  bool
+		prepare func(r *http.Request)
+	}{
+		{
+			name:   "POST without cookie",
+			useTLS: false,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Origin", "http://www.gorillatoolkit.org")
+			},
+		},
+		{
+			name:   "POST with malformed cookie",
+			useTLS: true,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Origin", "https://www.gorillatoolkit.org")
+				r.Header.Set("Cookie", cookieName+"=tampered-value")
+				r.Header.Set("X-CSRF-Token", token)
+			},
+		},
+		{
+			name:   "POST missing request token",
+			useTLS: true,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Cookie", validCookie)
+				r.Header.Set("Referer", "https://www.gorillatoolkit.org/")
+			},
+		},
+		{
+			name:   "POST with mismatched token",
+			useTLS: true,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Cookie", validCookie)
+				r.Header.Set("X-CSRF-Token", "not-the-issued-token")
+				r.Header.Set("Referer", "https://www.gorillatoolkit.org/")
+			},
+		},
+		{
+			name:   "POST with untrusted origin",
+			useTLS: true,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Cookie", validCookie)
+				r.Header.Set("Origin", "https://evil.example.org")
+			},
+		},
+		{
+			name:   "POST without referer over TLS",
+			useTLS: true,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Cookie", validCookie)
+			},
+		},
+		{
+			name:   "POST with cross-site referer",
+			useTLS: true,
+			prepare: func(r *http.Request) {
+				r.Header.Set("Cookie", validCookie)
+				r.Header.Set("Referer", "https://evil.example.org/")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := createRequest("POST", "/", tt.useTLS)
+			tt.prepare(r)
+
+			rr := httptest.NewRecorder()
+			p.ServeHTTP(rr, r)
+
+			if rr.Code != http.StatusForbidden {
+				t.Fatalf("status: got %v want %v", rr.Code, http.StatusForbidden)
+			}
+
+			if got := rr.Header().Get("Vary"); got != "Cookie" {
+				t.Fatalf("Vary: got %q want %q", got, "Cookie")
+			}
+
+			if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("Cache-Control: got %q want %q", got, "no-store")
+			}
+
+			if got := rr.Header().Get("Pragma"); got != "no-cache" {
+				t.Fatalf("Pragma: got %q want %q", got, "no-cache")
+			}
+
+			if got := rr.Header().Get("Set-Cookie"); got != "" {
+				t.Fatalf("rejection must not carry a reusable token cookie: got %q", got)
+			}
+		})
+	}
+}
+
+// TestSuccessResponseCacheBoundary pins the success side of the matrix: a
+// successful response is still allowed to establish the session cookie, but it
+// must carry the same Vary: Cookie identity boundary and must not be marked
+// no-store by the middleware.
+func TestSuccessResponseCacheBoundary(t *testing.T) {
+	s := http.NewServeMux()
+	s.HandleFunc("/", testHandler)
+	p := Protect(testKey)(s)
+
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, createRequest("GET", "/", true))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status: got %v want %v", rr.Code, http.StatusOK)
+	}
+
+	if got := rr.Header().Get("Vary"); got != "Cookie" {
+		t.Fatalf("Vary: got %q want %q", got, "Cookie")
+	}
+
+	if rr.Header().Get("Set-Cookie") == "" {
+		t.Fatal("success response must still issue the session cookie")
+	}
+
+	if got := rr.Header().Get("Cache-Control"); got == "no-store" {
+		t.Fatalf("middleware must not mark successful responses no-store: got %q", got)
+	}
+}
+
+// TestRejectionHeadersWithCustomErrorHandler ensures the cache boundary is
+// applied before the configurable ErrorHandler runs, so custom handlers cannot
+// accidentally emit a cacheable, cookieless rejection.
+func TestRejectionHeadersWithCustomErrorHandler(t *testing.T) {
+	s := http.NewServeMux()
+	s.HandleFunc("/", testHandler)
+
+	errorHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if FailureReason(r) == nil {
+			t.Error("failure reason not propagated to custom error handler")
+		}
+		w.WriteHeader(http.StatusForbidden)
+	})
+
+	p := Protect(testKey, ErrorHandler(errorHandler))(s)
+
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, createRequest("POST", "/", false))
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status: got %v want %v", rr.Code, http.StatusForbidden)
+	}
+
+	if got := rr.Header().Get("Vary"); got != "Cookie" {
+		t.Fatalf("Vary: got %q want %q", got, "Cookie")
+	}
+
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control: got %q want %q", got, "no-store")
+	}
+
+	if got := rr.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("Pragma: got %q want %q", got, "no-cache")
+	}
+
+	if got := rr.Header().Get("Set-Cookie"); got != "" {
+		t.Fatalf("rejection must not carry a reusable token cookie: got %q", got)
+	}
 }

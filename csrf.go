@@ -26,6 +26,16 @@ const (
 
 type contextKey string
 
+// Cache control headers used on CSRF failure responses. These prevent
+// shared and private caches from storing a rejection (which is scoped to the
+// requesting identity) and replaying it for another user.
+const (
+	cacheControlHeader  = "Cache-Control"
+	cacheControlNoStore = "no-store"
+	pragmaHeader        = "Pragma"
+	pragmaNoCache       = "no-cache"
+)
+
 // PlaintextHTTPContextKey is the context key used to store whether the request
 // is being served via plaintext HTTP. This is used to signal to the middleware
 // that strict Referer checking should not be enforced as is done for HTTPS by
@@ -225,32 +235,8 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Retrieve the token from the session.
 	// An error represents either a cookie that failed HMAC validation
 	// or that doesn't exist.
-	realToken, err := cs.st.Get(r)
-	if err != nil || len(realToken) != tokenLength {
-		// If there was an error retrieving the token, the token doesn't exist
-		// yet, or it's the wrong length, generate a new token.
-		// Note that the new token will (correctly) fail validation downstream
-		// as it will no longer match the request token.
-		realToken, err = generateRandomBytes(tokenLength)
-		if err != nil {
-			r = envError(r, err)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
-		}
-
-		// Save the new (real) token in the session store.
-		err = cs.st.Save(realToken, w)
-		if err != nil {
-			r = envError(r, err)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
-		}
-	}
-
-	// Save the masked token to the request context
-	r = contextSave(r, tokenKey, mask(realToken, r))
-	// Save the field name to the request context
-	r = contextSave(r, formKey, cs.opts.FieldName)
+	realToken, realTokenErr := cs.st.Get(r)
+	sessionValid := realTokenErr == nil && len(realToken) == tokenLength
 
 	// HTTP methods not defined as idempotent ("safe") under RFC7231 require
 	// inspection.
@@ -281,13 +267,11 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if origin != "" {
 			parsedOrigin, err := url.Parse(origin)
 			if err != nil {
-				r = envError(r, ErrBadOrigin)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				cs.reject(w, r, ErrBadOrigin)
 				return
 			}
 			if !sameOrigin(&requestURL, parsedOrigin) && !slices.Contains(cs.opts.TrustedOrigins, parsedOrigin.Host) {
-				r = envError(r, ErrBadOrigin)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				cs.reject(w, r, ErrBadOrigin)
 				return
 			}
 		}
@@ -303,15 +287,13 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// otherwise fails to parse.
 			referer, err := url.Parse(r.Referer())
 			if err != nil || referer.String() == "" {
-				r = envError(r, ErrNoReferer)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				cs.reject(w, r, ErrNoReferer)
 				return
 			}
 
 			// disallow cleartext HTTP referers when serving via TLS
 			if referer.Scheme == "http" {
-				r = envError(r, ErrBadReferer)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				cs.reject(w, r, ErrBadReferer)
 				return
 			}
 
@@ -319,23 +301,28 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// same origin, check the domain against our allowlist. We only
 			// check when we have host information from the referer.
 			if referer.Host != "" && referer.Host != r.Host && !slices.Contains(cs.opts.TrustedOrigins, referer.Host) {
-				r = envError(r, ErrBadReferer)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
+				cs.reject(w, r, ErrBadReferer)
 				return
 			}
+		}
+
+		// On a non-idempotent request a missing or invalid session token means
+		// the request cannot be authenticated, so reject it directly without
+		// issuing a fresh, reusable token.
+		if !sessionValid {
+			cs.reject(w, r, ErrBadToken)
+			return
 		}
 
 		// Retrieve the combined token (pad + masked) token...
 		maskedToken, err := cs.requestToken(r)
 		if err != nil {
-			r = envError(r, ErrBadToken)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
+			cs.reject(w, r, ErrBadToken)
 			return
 		}
 
 		if maskedToken == nil {
-			r = envError(r, ErrNoToken)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
+			cs.reject(w, r, ErrNoToken)
 			return
 		}
 
@@ -344,12 +331,35 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Compare the request token against the real token
 		if !compareTokens(requestToken, realToken) {
-			r = envError(r, ErrBadToken)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
+			cs.reject(w, r, ErrBadToken)
 			return
 		}
 
 	}
+
+	// If the session did not contain a valid token, generate a new one. This
+	// only happens for idempotent (safe) methods or requests that have already
+	// passed CSRF validation, so issuing a fresh token is safe.
+	if !sessionValid {
+		var err error
+		realToken, err = generateRandomBytes(tokenLength)
+		if err != nil {
+			cs.reject(w, r, err)
+			return
+		}
+
+		// Save the new (real) token in the session store.
+		err = cs.st.Save(realToken, w)
+		if err != nil {
+			cs.reject(w, r, err)
+			return
+		}
+	}
+
+	// Save the masked token to the request context
+	r = contextSave(r, tokenKey, mask(realToken, r))
+	// Save the field name to the request context
+	r = contextSave(r, formKey, cs.opts.FieldName)
 
 	// Set the Vary: Cookie header to protect clients from caching the response.
 	w.Header().Add("Vary", "Cookie")
@@ -358,6 +368,19 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cs.h.ServeHTTP(w, r)
 	// Clear the request context after the handler has completed.
 	contextClear(r)
+}
+
+// reject terminates a request that fails CSRF validation. It applies the same
+// identity-based cache boundary as a successful response (Vary: Cookie) plus
+// no-store directives so the rejection is never cached and replayed for
+// another identity. No CSRF token cookie is issued on the failure path, so a
+// rejected response never carries a token that a client could reuse.
+func (cs *csrf) reject(w http.ResponseWriter, r *http.Request, reason error) {
+	w.Header().Set(cacheControlHeader, cacheControlNoStore)
+	w.Header().Set(pragmaHeader, pragmaNoCache)
+	w.Header().Add("Vary", "Cookie")
+	r = envError(r, reason)
+	cs.opts.ErrorHandler.ServeHTTP(w, r)
 }
 
 // PlaintextHTTPRequest accepts as input a http.Request and returns a new
