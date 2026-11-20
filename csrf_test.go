@@ -1,9 +1,12 @@
 package csrf
 
 import (
+	"bytes"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -541,4 +544,119 @@ func createRequest(method, path string, useTLS bool) *http.Request {
 		return PlaintextHTTPRequest(r)
 	}
 	return r
+}
+
+// TestRequestTokenSources is a fixed request matrix covering how the
+// middleware treats tokens delivered via the header, the POST form and/or a
+// multipart form. A single source keeps working (backwards-compatible
+// submissions), while conflicting or duplicated sources fail closed with a
+// 403 - the historical header > form > multipart priority no longer lets one
+// source silently win over another.
+func TestRequestTokenSources(t *testing.T) {
+	// Token placement sentinels resolved against the per-request token.
+	const (
+		absent  = ""
+		valid   = "valid"
+		invalid = "invalid"
+	)
+
+	tests := []struct {
+		name      string
+		header    string
+		form      string
+		multipart string
+		wantCode  int
+		wantErr   error
+	}{
+		// Compatible submissions: exactly one source carries the token.
+		{"header only", valid, absent, absent, http.StatusOK, nil},
+		{"form only", absent, valid, absent, http.StatusOK, nil},
+		{"multipart only", absent, absent, valid, http.StatusOK, nil},
+		// A single malformed source still fails as a bad token.
+		{"header only invalid", invalid, absent, absent, http.StatusForbidden, ErrBadToken},
+		{"form only invalid", absent, invalid, absent, http.StatusForbidden, ErrBadToken},
+		{"multipart only invalid", absent, absent, invalid, http.StatusForbidden, ErrBadToken},
+		// No source at all.
+		{"no token", absent, absent, absent, http.StatusForbidden, ErrNoToken},
+		// Conflicting sources fail closed, regardless of which source would
+		// have won under the old priority order.
+		{"header valid + form invalid", valid, invalid, absent, http.StatusForbidden, ErrMultipleTokens},
+		{"header invalid + form valid", invalid, valid, absent, http.StatusForbidden, ErrMultipleTokens},
+		{"header valid + multipart invalid", valid, absent, invalid, http.StatusForbidden, ErrMultipleTokens},
+		{"header invalid + multipart valid", invalid, absent, valid, http.StatusForbidden, ErrMultipleTokens},
+		// Duplicated sources fail closed even when the values agree.
+		{"header + form duplicate", valid, valid, absent, http.StatusForbidden, ErrMultipleTokens},
+		{"header + multipart duplicate", valid, absent, valid, http.StatusForbidden, ErrMultipleTokens},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var token string
+			var finalErr error
+
+			s := http.NewServeMux()
+			s.Handle("/", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				token = Token(r)
+			}))
+			p := Protect(testKey, ErrorHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				finalErr = FailureReason(r)
+				w.WriteHeader(http.StatusForbidden)
+			})))(s)
+
+			// Obtain a CSRF cookie & token via a GET request.
+			r := createRequest("GET", "/", false)
+			rr := httptest.NewRecorder()
+			p.ServeHTTP(rr, r)
+
+			resolve := func(v string) string {
+				switch v {
+				case valid:
+					return token
+				case invalid:
+					return "this-is-an-invalid-token"
+				}
+				return ""
+			}
+
+			// Build the POST request, placing the token in the form or
+			// multipart body as directed by the matrix row.
+			switch {
+			case tt.form != absent:
+				body := url.Values{fieldName: {resolve(tt.form)}}.Encode()
+				r = httptest.NewRequest("POST", "/", strings.NewReader(body))
+				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			case tt.multipart != absent:
+				var buf bytes.Buffer
+				w := multipart.NewWriter(&buf)
+				if err := w.WriteField(fieldName, resolve(tt.multipart)); err != nil {
+					t.Fatalf("failed to write multipart field: %v", err)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatalf("failed to close multipart writer: %v", err)
+				}
+				r = httptest.NewRequest("POST", "/", &buf)
+				r.Header.Set("Content-Type", w.FormDataContentType())
+			default:
+				r = httptest.NewRequest("POST", "/", nil)
+			}
+			r.Host = "www.gorillatoolkit.org"
+			r = PlaintextHTTPRequest(r)
+
+			setCookie(rr, r)
+			if tt.header != absent {
+				r.Header.Set(headerName, resolve(tt.header))
+			}
+
+			rr = httptest.NewRecorder()
+			p.ServeHTTP(rr, r)
+
+			if rr.Code != tt.wantCode {
+				t.Fatalf("got status %v want %v", rr.Code, tt.wantCode)
+			}
+
+			if tt.wantErr != nil && finalErr != tt.wantErr {
+				t.Fatalf("got failure reason %v want %v", finalErr, tt.wantErr)
+			}
+		})
+	}
 }

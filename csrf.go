@@ -62,6 +62,11 @@ var (
 	// ErrBadToken is returned if the CSRF token in the request does not match
 	// the token in the session, or is otherwise malformed.
 	ErrBadToken = errors.New("CSRF token invalid")
+	// ErrMultipleTokens is returned if the CSRF token is supplied by more
+	// than one request source (header, POST form or multipart form), whether
+	// the values conflict or are duplicated. Requests are failed closed in
+	// this case so that proxies and handlers cannot disagree on the token.
+	ErrMultipleTokens = errors.New("CSRF token provided by multiple request sources")
 )
 
 // SameSiteMode allows a server to define a cookie attribute making it impossible for
@@ -328,7 +333,11 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Retrieve the combined token (pad + masked) token...
 		maskedToken, err := cs.requestToken(r)
 		if err != nil {
-			r = envError(r, ErrBadToken)
+			if errors.Is(err, ErrMultipleTokens) {
+				r = envError(r, ErrMultipleTokens)
+			} else {
+				r = envError(r, ErrBadToken)
+			}
 			cs.opts.ErrorHandler.ServeHTTP(w, r)
 			return
 		}

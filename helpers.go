@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"html/template"
+	"mime"
 	"net/http"
 	"net/url"
 )
@@ -102,24 +103,43 @@ func unmask(issued []byte) []byte {
 	return xorToken(otp, masked)
 }
 
-// requestToken returns the issued token (pad + masked token) from the HTTP POST
-// body or HTTP header. It will return nil if the token fails to decode.
+// requestToken returns the issued token (pad + masked token) from the HTTP
+// header, the POST form or the multipart form. Exactly one source may carry a
+// token: if multiple sources supply a value - whether conflicting or
+// duplicated - ErrMultipleTokens is returned so the request fails closed
+// instead of letting proxies and handlers disagree on the token. It will
+// return nil if the token fails to decode.
 func (cs *csrf) requestToken(r *http.Request) ([]byte, error) {
-	// 1. Check the HTTP header first.
-	issued := r.Header.Get(cs.opts.RequestHeader)
+	var issued string
+	var sources int
 
-	// 2. Fall back to the POST (form) value.
-	if issued == "" {
-		issued = r.PostFormValue(cs.opts.FieldName)
+	// 1. Check the HTTP header.
+	if val := r.Header.Get(cs.opts.RequestHeader); val != "" {
+		issued = val
+		sources++
 	}
 
-	// 3. Finally, fall back to the multipart form (if set).
-	if issued == "" && r.MultipartForm != nil {
-		vals := r.MultipartForm.Value[cs.opts.FieldName]
-
-		if len(vals) > 0 {
-			issued = vals[0]
+	// 2. Check the request body, which is either a URL-encoded POST form or
+	// a multipart form depending on the Content-Type. Note that net/http
+	// copies multipart values into r.PostForm as well (golang/go#9305), so
+	// the two must not be counted as separate sources.
+	if mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mediaType == "multipart/form-data" {
+		// Ignore parse errors: a nil MultipartForm simply yields no token.
+		_ = r.ParseMultipartForm(32 << 20)
+		if r.MultipartForm != nil {
+			if vals := r.MultipartForm.Value[cs.opts.FieldName]; len(vals) > 0 && vals[0] != "" {
+				issued = vals[0]
+				sources++
+			}
 		}
+	} else if val := r.PostFormValue(cs.opts.FieldName); val != "" {
+		issued = val
+		sources++
+	}
+
+	// Fail closed when more than one source carries a token.
+	if sources > 1 {
+		return nil, ErrMultipleTokens
 	}
 
 	// Return nil (equivalent to empty byte slice) if no token was found
